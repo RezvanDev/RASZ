@@ -42,6 +42,8 @@ DEFAULT_CATEGORIES = [
     # Расходы
     ("Продукты и супермаркеты", TransactionType.EXPENSE, "🛒"),
     ("Кафе, рестораны и доставка", TransactionType.EXPENSE, "🍽️"),
+    ("Напитки", TransactionType.EXPENSE, "🥤"),
+    ("Табак и никотин", TransactionType.EXPENSE, "🚬"),
     ("Транспорт и такси", TransactionType.EXPENSE, "🚕"),
     ("Жилье и коммуналка", TransactionType.EXPENSE, "🏠"),
     ("Здоровье и аптеки", TransactionType.EXPENSE, "💊"),
@@ -63,14 +65,18 @@ async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     
-    # Seed default categories if empty
+    # Seed default categories if any are missing
     async with AsyncSessionFactory() as session:
         stmt = select(Category).where(Category.user_id.is_(None))
         result = await session.execute(stmt)
         existing = result.scalars().all()
-        if not existing:
-            for name, c_type, icon in DEFAULT_CATEGORIES:
+        existing_names = {c.name.lower() for c in existing}
+        added = False
+        for name, c_type, icon in DEFAULT_CATEGORIES:
+            if name.lower() not in existing_names:
                 session.add(Category(name=name, type=c_type, icon=icon, user_id=None))
+                added = True
+        if added:
             await session.commit()
-            logger.info("Default categories seeded successfully.")
+            logger.info("Default categories updated and seeded successfully.")
 

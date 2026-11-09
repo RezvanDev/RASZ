@@ -159,8 +159,9 @@ async def handle_switch_acc_callback(callback: CallbackQuery, finance: FinanceSe
     all_accounts = await finance.get_accounts(user_id)
     reply_markup = build_tx_action_keyboard(tx_id, res["new_account"], all_accounts)
 
+    icon = res.get("icon", "💡")
     text = (
-        f"✅ <b>Записано:</b> {res['category']} -{res['amount']:,.0f} сум\n"
+        f"✅ <b>Записано:</b> {icon} {res['category']} -{res['amount']:,.0f} сум\n"
         f"💳 <b>Счет списания:</b> {res['new_account']} (остаток: <b>{res['new_balance']:,.0f} сум</b>)\n"
         f"<i>(Счет {res['old_account']} восстановлен: {res['old_balance']:,.0f} сум)</i>"
     )
@@ -170,6 +171,81 @@ async def handle_switch_acc_callback(callback: CallbackQuery, finance: FinanceSe
     except Exception:
         pass
     await callback.answer(f"Счет изменен на {res['new_account']}")
+
+@router.callback_query(F.data.startswith("cat_menu_"))
+async def handle_cat_menu_callback(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    if len(parts) < 3 or not parts[2].isdigit():
+        await callback.answer("Ошибка", show_alert=True)
+        return
+    tx_id = int(parts[2])
+    from bot.handlers.messages import build_category_selection_keyboard
+    try:
+        await callback.message.edit_reply_markup(reply_markup=build_category_selection_keyboard(tx_id))
+    except Exception:
+        pass
+    await callback.answer("Выберите категорию")
+
+@router.callback_query(F.data.startswith("cat_back_"))
+async def handle_cat_back_callback(callback: CallbackQuery, finance: FinanceService):
+    parts = callback.data.split("_")
+    if len(parts) < 3 or not parts[2].isdigit():
+        await callback.answer("Ошибка", show_alert=True)
+        return
+    tx_id = int(parts[2])
+    user_id = callback.from_user.id
+    all_accounts = await finance.get_accounts(user_id)
+
+    from bot.database.models import Transaction
+    from sqlalchemy import select
+    from sqlalchemy.orm import selectinload
+    stmt = select(Transaction).where(Transaction.id == tx_id, Transaction.user_id == user_id).options(selectinload(Transaction.account))
+    res = await finance.session.execute(stmt)
+    tx = res.scalar_one_or_none()
+    current_acc = tx.account.name if tx and tx.account else ""
+
+    from bot.handlers.messages import build_tx_action_keyboard
+    try:
+        await callback.message.edit_reply_markup(reply_markup=build_tx_action_keyboard(tx_id, current_acc, all_accounts))
+    except Exception:
+        pass
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("set_cat_"))
+async def handle_set_cat_callback(callback: CallbackQuery, finance: FinanceService):
+    parts = callback.data.split("_")
+    if len(parts) != 4 or not parts[2].isdigit():
+        await callback.answer("Ошибка запроса", show_alert=True)
+        return
+
+    tx_id = int(parts[2])
+    cat_code = parts[3]
+    from bot.handlers.messages import CATEGORY_CODE_MAP, build_tx_action_keyboard
+    target_cat_name = CATEGORY_CODE_MAP.get(cat_code)
+    if not target_cat_name:
+        await callback.answer("Неизвестная категория", show_alert=True)
+        return
+
+    user_id = callback.from_user.id
+    res = await finance.switch_transaction_category(tx_id, user_id, target_cat_name)
+    if not res:
+        await callback.answer("Операция не найдена или удалена", show_alert=True)
+        return
+
+    all_accounts = await finance.get_accounts(user_id)
+    reply_markup = build_tx_action_keyboard(tx_id, res["account"], all_accounts)
+
+    text = (
+        f"✅ <b>Записано:</b> {res['icon']} {res['category']} -{res['amount']:,.0f} сум\n"
+        f"💳 <b>Счет списания:</b> {res['account']} (остаток: <b>{res['balance']:,.0f} сум</b>)\n"
+        f"🏷 <b>Категория изменена на:</b> {res['icon']} {res['category']}"
+    )
+
+    try:
+        await callback.message.edit_text(text, reply_markup=reply_markup)
+    except Exception:
+        pass
+    await callback.answer(f"Категория изменена: {res['category']}")
 
 @router.callback_query(F.data == "adv_buffett")
 async def handle_adv_buffett(callback: CallbackQuery):

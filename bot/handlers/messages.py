@@ -12,8 +12,35 @@ logger = logging.getLogger(__name__)
 router = Router()
 ai_service = AIService()
 
+POPULAR_CATEGORIES = [
+    ("🥤 Напитки", "drinks", "Напитки"),
+    ("🚬 Табак/никотин", "tobacco", "Табак и никотин"),
+    ("🛒 Продукты", "food", "Продукты и супермаркеты"),
+    ("🍽️ Кафе и еда", "cafe", "Кафе, рестораны и доставка"),
+    ("🚕 Такси/транспорт", "taxi", "Транспорт и такси"),
+    ("💊 Аптека", "health", "Здоровье и аптеки"),
+    ("🎉 Отдых", "fun", "Развлечения и отдых"),
+    ("📦 Прочее", "other", "Прочие расходы"),
+]
+
+CATEGORY_CODE_MAP = {code: name for _, code, name in POPULAR_CATEGORIES}
+
+def build_category_selection_keyboard(tx_id: int) -> InlineKeyboardMarkup:
+    """Builds inline keyboard with popular categories for quick 1-tap switching."""
+    buttons = []
+    row = []
+    for label, code, _ in POPULAR_CATEGORIES:
+        row.append(InlineKeyboardButton(text=label, callback_data=f"set_cat_{tx_id}_{code}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"cat_back_{tx_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
 def build_tx_action_keyboard(tx_id: int, current_account_name: str, accounts: list) -> InlineKeyboardMarkup:
-    """Builds inline keyboard with quick account-switching buttons and undo button."""
+    """Builds inline keyboard with quick account-switching buttons, category switcher, and undo button."""
     buttons = []
     switch_row = []
     for a in accounts:
@@ -27,6 +54,10 @@ def build_tx_action_keyboard(tx_id: int, current_account_name: str, accounts: li
                 switch_row = []
     if switch_row:
         buttons.append(switch_row)
+
+    buttons.append([
+        InlineKeyboardButton(text="🏷 Сменить категорию", callback_data=f"cat_menu_{tx_id}")
+    ])
 
     buttons.append([
         InlineKeyboardButton(text="❌ Отменить операцию", callback_data=f"undo_tx_{tx_id}")

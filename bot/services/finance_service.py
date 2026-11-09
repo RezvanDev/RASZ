@@ -217,6 +217,29 @@ class FinanceService:
         await self.session.refresh(tx)
         return from_acc, to_acc, tx
 
+    @staticmethod
+    def get_category_icon(category_name: str) -> str:
+        name_lower = category_name.lower()
+        if any(w in name_lower for w in ["табак", "никотин", "снюс", "сигарет", "вейп", "кальян", "стик"]):
+            return "🚬"
+        if any(w in name_lower for w in ["напит", "чай", "кофе", "сок", "липтон", "кола", "вода", "энергетик"]):
+            return "🥤"
+        if any(w in name_lower for w in ["продукт", "супермаркет", "корзинк", "макро"]):
+            return "🛒"
+        if any(w in name_lower for w in ["кафе", "ресторан", "еда", "доставк", "обед", "ужин", "фастфуд", "бургер", "лаваш"]):
+            return "🍽️"
+        if any(w in name_lower for w in ["такси", "транспорт", "авто", "бензин", "заправк", "метро"]):
+            return "🚕"
+        if any(w in name_lower for w in ["аптек", "здоровь", "лекарств", "врач"]):
+            return "💊"
+        if any(w in name_lower for w in ["одежд", "обувь", "вещи"]):
+            return "👔"
+        if any(w in name_lower for w in ["развлечен", "отдых", "кино", "игры"]):
+            return "🎉"
+        if any(w in name_lower for w in ["техник", "гаджет", "телефон", "компьютер"]):
+            return "💻"
+        return "💡"
+
     async def get_or_create_category(self, user_id: int, category_name: str, tx_type: TransactionType) -> Category:
         clean_name = category_name.strip()
         stmt = select(Category).where(
@@ -235,7 +258,7 @@ class FinanceService:
             user_id=user_id,
             name=clean_name.capitalize(),
             type=tx_type,
-            icon="💡"
+            icon=self.get_category_icon(clean_name)
         )
         self.session.add(cat)
         await self.session.flush()
@@ -659,11 +682,47 @@ class FinanceService:
             "tx_id": tx.id,
             "amount": amount,
             "category": tx.category.name if tx.category else "Прочие расходы",
+            "icon": tx.category.icon if tx.category else "💡",
             "old_account": old_account.name if old_account else None,
             "old_balance": old_account.balance if old_account else 0.0,
             "new_account": new_account.name,
             "new_balance": new_account.balance,
             "account_id": new_account.id
+        }
+
+    async def switch_transaction_category(
+        self,
+        tx_id: int,
+        user_id: int,
+        new_category_name: str
+    ) -> Optional[Dict[str, Any]]:
+        """Changes the category of an existing transaction."""
+        stmt = select(Transaction).where(
+            Transaction.id == tx_id,
+            Transaction.user_id == user_id
+        ).options(
+            selectinload(Transaction.account),
+            selectinload(Transaction.category)
+        )
+        res = await self.session.execute(stmt)
+        tx = res.scalar_one_or_none()
+        if not tx:
+            return None
+
+        cat = await self.get_or_create_category(user_id, new_category_name, tx.type)
+        tx.category_id = cat.id
+        await self.session.commit()
+        await self.session.refresh(tx)
+        await self.session.refresh(cat)
+
+        return {
+            "tx_id": tx.id,
+            "category": cat.name,
+            "icon": cat.icon,
+            "amount": tx.amount,
+            "description": tx.description or "",
+            "account": tx.account.name if tx.account else "Основной",
+            "balance": tx.account.balance if tx.account else 0.0
         }
 
     async def export_transactions_csv(self, user_id: int) -> str:
