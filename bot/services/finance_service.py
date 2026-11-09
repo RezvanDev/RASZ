@@ -350,6 +350,9 @@ class FinanceService:
 
     async def get_financial_stats(self, user_id: int, start_date: datetime, end_date: datetime) -> Dict[str, Any]:
         """Calculates income, expenses, category breakdown, savings rate and runway."""
+        # Include buffer to prevent microsecond edge condition exclusions
+        query_end = (end_date + timedelta(minutes=1)) if end_date else (datetime.utcnow() + timedelta(minutes=1))
+
         # 1. Total expenses & incomes
         stmt_totals = select(
             Transaction.type,
@@ -357,7 +360,7 @@ class FinanceService:
         ).where(
             Transaction.user_id == user_id,
             Transaction.date >= start_date,
-            Transaction.date <= end_date
+            Transaction.date <= query_end
         ).group_by(Transaction.type)
 
         totals_res = await self.session.execute(stmt_totals)
@@ -381,7 +384,7 @@ class FinanceService:
             Transaction.user_id == user_id,
             Transaction.type == TransactionType.EXPENSE,
             Transaction.date >= start_date,
-            Transaction.date <= end_date
+            Transaction.date <= query_end
         ).group_by(Category.id).order_by(func.sum(Transaction.amount).desc())
 
         cats_res = await self.session.execute(stmt_cats)
@@ -593,10 +596,11 @@ class FinanceService:
         writer.writerow(["ID", "Дата и время", "Тип", "Категория", "Сумма (сум)", "Счет", "Комментарий"])
 
         for t in txs:
+            t_type_val = t.type.value if hasattr(t.type, "value") else str(t.type)
             writer.writerow([
                 t.id,
                 t.date.strftime("%Y-%m-%d %H:%M:%S") if t.date else "",
-                t.type.value,
+                t_type_val,
                 t.category.name if t.category else "Общее",
                 f"{t.amount:.2f}",
                 t.account.name if t.account else "",
