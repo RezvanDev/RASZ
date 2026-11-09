@@ -63,9 +63,9 @@ class FinanceService:
 
         import re
         raw_name = name.strip()
-        # Clean prefix noise like 'остаток задолженности по', 'долг по'
+        # Clean prefix noise like 'остаток задолженности по', 'долг по', 'с карты', 'карта'
         clean_target = re.sub(
-            r'^(остаток\s+(задолженности|долга)?\s*(по)?|задолженность\s*(по)?|долг\s*(по)?)\s*',
+            r'^(остаток\s+(задолженности|долга)?\s*(по)?|задолженность\s*(по)?|долг\s*(по)?|карта\s*|карты\s*|счет\s*|счета\s*|с\s+|со\s+|на\s+|в\s+|из\s+)\s*',
             '',
             raw_name,
             flags=re.IGNORECASE
@@ -87,17 +87,23 @@ class FinanceService:
             if clean_target in a_lower or a_lower in clean_target:
                 return a
 
-        # 3. Significant keywords overlap (brands like 'tez', 'skillbox', 'авто', 'uzum')
-        stop_words = {"кредитная", "карта", "счет", "вклад", "рассрочка", "банк", "по", "за", "на", "uzs", "сум"}
+        # 3. Significant keywords overlap scoring (account with highest number of matching words wins)
+        stop_words = {"кредитная", "карта", "карты", "счет", "счета", "вклад", "рассрочка", "банк", "банка", "по", "за", "на", "uzs", "сум", "с", "со", "из"}
         target_words = set(re.findall(r'[a-zа-яё0-9]+', clean_target)) - stop_words
 
         if target_words:
+            best_acc = None
+            best_score = 0
             for a in accounts:
                 if account_type and a.account_type != account_type:
                     continue
                 a_words = set(re.findall(r'[a-zа-яё0-9]+', a.name.lower())) - stop_words
-                if target_words & a_words:
-                    return a
+                overlap = len(target_words & a_words)
+                if overlap > best_score:
+                    best_score = overlap
+                    best_acc = a
+            if best_acc and best_score > 0:
+                return best_acc
 
         return None
 
@@ -108,12 +114,26 @@ class FinanceService:
 
         # Helper to find default debit card
         def default_debit():
-            for a in accounts:
-                if a.account_type == AccountType.CARD:
-                    return a
-            for a in accounts:
-                if a.account_type == AccountType.CASH:
-                    return a
+            # 1. Prefer active debit cards (CARD) with positive balance > 0 (e.g. Visa TBC)
+            pos_cards = [a for a in accounts if a.account_type == AccountType.CARD and a.balance > 0]
+            if pos_cards:
+                return pos_cards[0]
+            # 2. Cash accounts with positive balance
+            pos_cash = [a for a in accounts if a.account_type == AccountType.CASH and a.balance > 0]
+            if pos_cash:
+                return pos_cash[0]
+            # 3. Debit cards with balance >= 0
+            non_neg_cards = [a for a in accounts if a.account_type == AccountType.CARD and a.balance >= 0]
+            if non_neg_cards:
+                return non_neg_cards[0]
+            # 4. Any debit card
+            cards = [a for a in accounts if a.account_type == AccountType.CARD]
+            if cards:
+                return cards[0]
+            # 5. Non-credit accounts
+            non_credits = [a for a in accounts if a.account_type != AccountType.CREDIT_CARD]
+            if non_credits:
+                return non_credits[0]
             return accounts[0]
 
         if not name or not name.strip():
@@ -578,6 +598,73 @@ class FinanceService:
         if not last_tx:
             return None
         return await self.delete_transaction(last_tx.id, user_id)
+
+    async def switch_transaction_account(
+        self,
+        tx_id: int,
+        user_id: int,
+        new_account_id: int
+    ) -> Optional[Dict[str, Any]]:
+        """Transfers an existing transaction to a new account, safely updating balances on both accounts."""
+        stmt = select(Transaction).where(
+            Transaction.id == tx_id,
+            Transaction.user_id == user_id
+        ).options(
+            selectinload(Transaction.account),
+            selectinload(Transaction.category)
+        )
+        res = await self.session.execute(stmt)
+        tx = res.scalar_one_or_none()
+        if not tx:
+            return None
+
+        old_account = tx.account
+        new_stmt = select(Account).where(
+            Account.id == new_account_id,
+            Account.user_id == user_id
+        )
+        new_res = await self.session.execute(new_stmt)
+        new_account = new_res.scalar_one_or_none()
+        if not new_account:
+            return None
+        if old_account and old_account.id == new_account.id:
+            return None
+
+        amount = tx.amount
+        tx_type = tx.type
+
+        # 1. Rollback amount on old account
+        if old_account:
+            if tx_type == TransactionType.EXPENSE:
+                old_account.balance += amount
+            elif tx_type in (TransactionType.INCOME, TransactionType.PASSIVE_INCOME):
+                old_account.balance -= amount
+
+        # 2. Apply amount to new account
+        if tx_type == TransactionType.EXPENSE:
+            new_account.balance -= amount
+        elif tx_type in (TransactionType.INCOME, TransactionType.PASSIVE_INCOME):
+            new_account.balance += amount
+
+        # 3. Update transaction reference
+        tx.account_id = new_account.id
+
+        await self.session.commit()
+        if old_account:
+            await self.session.refresh(old_account)
+        await self.session.refresh(new_account)
+        await self.session.refresh(tx)
+
+        return {
+            "tx_id": tx.id,
+            "amount": amount,
+            "category": tx.category.name if tx.category else "Прочие расходы",
+            "old_account": old_account.name if old_account else None,
+            "old_balance": old_account.balance if old_account else 0.0,
+            "new_account": new_account.name,
+            "new_balance": new_account.balance,
+            "account_id": new_account.id
+        }
 
     async def export_transactions_csv(self, user_id: int) -> str:
         """Exports all user transactions in CSV format."""

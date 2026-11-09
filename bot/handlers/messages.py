@@ -6,10 +6,32 @@ from aiogram.enums import ChatAction
 
 from bot.services.finance_service import FinanceService
 from bot.services.ai_service import AIService
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 logger = logging.getLogger(__name__)
 router = Router()
 ai_service = AIService()
+
+def build_tx_action_keyboard(tx_id: int, current_account_name: str, accounts: list) -> InlineKeyboardMarkup:
+    """Builds inline keyboard with quick account-switching buttons and undo button."""
+    buttons = []
+    switch_row = []
+    for a in accounts:
+        if a.name != current_account_name:
+            switch_row.append(InlineKeyboardButton(
+                text=f"💳 {a.name}",
+                callback_data=f"switch_acc_{tx_id}_{a.id}"
+            ))
+            if len(switch_row) == 2:
+                buttons.append(switch_row)
+                switch_row = []
+    if switch_row:
+        buttons.append(switch_row)
+
+    buttons.append([
+        InlineKeyboardButton(text="❌ Отменить операцию", callback_data=f"undo_tx_{tx_id}")
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 # In-memory short-term context per user (last 6 messages)
 user_histories = {}
@@ -60,15 +82,14 @@ async def handle_photo_receipt(message: Message, bot: Bot, finance: FinanceServi
         caption=message.caption
     )
 
-    # 3. Attach Undo button if transaction was created
-    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    # 3. Attach Account switcher & Undo button if transaction was created
     reply_markup = None
     tx_actions = [a for a in result.get("actions", []) if a.get("type") == "transaction_added" and a.get("tx_id")]
     if len(tx_actions) == 1:
         tx_id = tx_actions[0]["tx_id"]
-        reply_markup = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="❌ Отменить операцию", callback_data=f"undo_tx_{tx_id}")
-        ]])
+        current_acc = tx_actions[0].get("account", "")
+        all_accounts = await finance.get_accounts(message.from_user.id)
+        reply_markup = build_tx_action_keyboard(tx_id, current_acc, all_accounts)
 
     try:
         await message.reply(result["text"], reply_markup=reply_markup)
@@ -157,15 +178,14 @@ async def process_text_finance(message: Message, bot: Bot, finance: FinanceServi
                 await message.answer(result["text"], parse_mode=None)
         return
 
-    # If transactions were added, offer one-click Undo button
-    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    # If transactions were added, offer Account Switcher and Undo button
     reply_markup = None
     tx_actions = [a for a in result.get("actions", []) if a.get("type") == "transaction_added" and a.get("tx_id")]
     if len(tx_actions) == 1:
         tx_id = tx_actions[0]["tx_id"]
-        reply_markup = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="❌ Отменить операцию", callback_data=f"undo_tx_{tx_id}")
-        ]])
+        current_acc = tx_actions[0].get("account", "")
+        all_accounts = await finance.get_accounts(user_id)
+        reply_markup = build_tx_action_keyboard(tx_id, current_acc, all_accounts)
 
     # Send response
     try:

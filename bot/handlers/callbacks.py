@@ -139,6 +139,38 @@ async def handle_undo_tx_callback(callback: CallbackQuery, finance: FinanceServi
     else:
         await callback.answer("Транзакция уже удалена или не найдена.", show_alert=True)
 
+@router.callback_query(F.data.startswith("switch_acc_"))
+async def handle_switch_acc_callback(callback: CallbackQuery, finance: FinanceService):
+    parts = callback.data.split("_")
+    if len(parts) != 4 or not parts[2].isdigit() or not parts[3].isdigit():
+        await callback.answer("Ошибка запроса", show_alert=True)
+        return
+
+    tx_id = int(parts[2])
+    target_acc_id = int(parts[3])
+    user_id = callback.from_user.id
+
+    res = await finance.switch_transaction_account(tx_id, user_id, target_acc_id)
+    if not res:
+        await callback.answer("Не удалось сменить счет (возможно, операция удалена)", show_alert=True)
+        return
+
+    from bot.handlers.messages import build_tx_action_keyboard
+    all_accounts = await finance.get_accounts(user_id)
+    reply_markup = build_tx_action_keyboard(tx_id, res["new_account"], all_accounts)
+
+    text = (
+        f"✅ <b>Записано:</b> {res['category']} -{res['amount']:,.0f} сум\n"
+        f"💳 <b>Счет списания:</b> {res['new_account']} (остаток: <b>{res['new_balance']:,.0f} сум</b>)\n"
+        f"<i>(Счет {res['old_account']} восстановлен: {res['old_balance']:,.0f} сум)</i>"
+    )
+
+    try:
+        await callback.message.edit_text(text, reply_markup=reply_markup)
+    except Exception:
+        pass
+    await callback.answer(f"Счет изменен на {res['new_account']}")
+
 @router.callback_query(F.data == "adv_buffett")
 async def handle_adv_buffett(callback: CallbackQuery):
     text = (

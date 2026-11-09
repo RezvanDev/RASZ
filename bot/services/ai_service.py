@@ -327,6 +327,85 @@ class AIService:
 """
         return context
 
+    @staticmethod
+    def extract_deterministic_tx(user_message: str, accounts: List[Any]) -> Optional[Dict[str, Any]]:
+        """
+        Deterministically parses transaction parameters from user text.
+        Guarantees extraction of amount, transaction type, mentioned account, and clean description.
+        """
+        import re
+        text = user_message.strip()
+        lower = text.lower().replace('\u00a0', ' ')
+
+        # 1. Skip pure advisory questions / dashboard requests
+        question_words = ["как ", "что ", "посоветуй", "подскажи", "почему", "зачем", "дашборд", "график", "отчет"]
+        if any(lower.startswith(q) or f" {q}" in lower for q in question_words) and not any(k in lower for k in ["потратил", "расход", "купил", "оплатил"]):
+            return None
+
+        # 2. Extract amount
+        amount = None
+        # Pattern 1: Millions (1.5 млн, 2 млн)
+        m_mln = re.search(r'(\d+(?:[.,]\d+)?)\s*(?:млн|миллион[а-я]*)', lower)
+        if m_mln:
+            amount = float(m_mln.group(1).replace(',', '.')) * 1_000_000
+        else:
+            # Pattern 2: Thousands (10к, 10k, 10 тыс, 10.5к)
+            m_th = re.search(r'(\d+(?:[.,]\d+)?)\s*(?:к\b|k\b|тыс\b|тысяч[а-я]*)', lower)
+            if m_th:
+                amount = float(m_th.group(1).replace(',', '.')) * 1_000
+            else:
+                # Pattern 3: Standard digits (50 000, 50000, 10000)
+                cleaned_digits = re.sub(r'(\d)\s+(\d)', r'\1\2', lower)
+                m_num = re.search(r'\b(\d+(?:[.,]\d+)?)\b', cleaned_digits)
+                if m_num:
+                    val = float(m_num.group(1).replace(',', '.'))
+                    # Avoid parsing small years or single digits unless with currency/keywords
+                    if val >= 500 or any(cur in lower for cur in ["сум", "$", "usd", "руб"]):
+                        amount = val
+
+        if not amount or amount <= 0:
+            return None
+
+        # 3. Determine transaction type (EXPENSE vs INCOME)
+        income_words = ["зарплата", "аванс", "доход", "получил", "получила", "перевели", "выплата", "премия"]
+        is_income = any(w in lower for w in income_words)
+        tx_type = TransactionType.INCOME if is_income else TransactionType.EXPENSE
+
+        # 4. Detect account name from text
+        matched_account_name = None
+        stop_words = {"с", "со", "на", "по", "карты", "карта", "счета", "счет", "банк", "банка", "в", "из"}
+        msg_words = set(re.findall(r'[a-zа-яё0-9]+', lower)) - stop_words
+
+        best_score = 0
+        for a in accounts:
+            a_words = set(re.findall(r'[a-zа-яё0-9]+', a.name.lower())) - stop_words
+            overlap = len(msg_words & a_words)
+            if overlap > best_score:
+                best_score = overlap
+                matched_account_name = a.name
+
+        # 5. Clean description
+        desc_clean = lower
+        # Remove amount expressions
+        desc_clean = re.sub(r'(\d+(?:[.,]\d+)?)\s*(?:млн|миллион[а-я]*|к|k|тыс|тысяч[а-я]*|сум|usd|\$)?', ' ', desc_clean)
+        # Remove action verbs
+        desc_clean = re.sub(r'\b(я\s+)?(потратил|потратила|купил|купила|оплатил|оплатила|расход|в\s+размере|доход|зарплата|списал|списано)\b', ' ', desc_clean)
+        # Remove matched account name words
+        if matched_account_name:
+            for w in re.findall(r'[a-zа-яё0-9]+', matched_account_name.lower()):
+                desc_clean = re.sub(r'\b' + re.escape(w) + r'\b', ' ', desc_clean)
+        # Remove prepositions and noise
+        desc_clean = re.sub(r'\b(с|со|на|в|из|по|карты|карта|карту|счета|счет|банка|банк)\b', ' ', desc_clean)
+        desc_words = [w for w in re.findall(r'[a-zа-яё0-9]+', desc_clean) if len(w) > 1]
+        description = " ".join(desc_words).strip() or ("Доход" if is_income else "Покупка")
+
+        return {
+            "amount": amount,
+            "type": tx_type,
+            "account_name": matched_account_name,
+            "description": description
+        }
+
     async def process_user_input(
         self,
         finance: FinanceService,
@@ -338,6 +417,8 @@ class AIService:
         Processes natural language or voice transcription.
         Executes tools and returns the actions executed along with the AI response.
         """
+        accounts = await finance.get_accounts(user_id)
+        deterministic_tx = self.extract_deterministic_tx(user_message, accounts)
         fin_context = await self.build_financial_context(finance, user_id)
 
         messages = [
@@ -348,7 +429,7 @@ class AIService:
             messages.extend(conversation_history[-6:])  # keep last turns
 
         messages.append({"role": "user", "content": user_message})
-        return await self._execute_chat_completion(finance, user_id, messages)
+        return await self._execute_chat_completion(finance, user_id, messages, deterministic_tx=deterministic_tx)
 
     async def process_receipt_image(
         self,
@@ -395,19 +476,53 @@ class AIService:
         self,
         finance: FinanceService,
         user_id: int,
-        messages: List[Dict[str, Any]]
+        messages: List[Dict[str, Any]],
+        deterministic_tx: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
+
+        # If a transaction was deterministically recognized in user message, force add_transaction tool choice
+        initial_tool_choice = {"type": "function", "function": {"name": "add_transaction"}} if deterministic_tx else "auto"
 
         try:
             response = await self.client.chat.completions.create(
                 model=settings.LLM_MODEL,
                 messages=messages,
                 tools=TOOLS_DEFINITIONS,
-                tool_choice="auto",
-                temperature=0.3
+                tool_choice=initial_tool_choice,
+                temperature=0.2
             )
         except Exception as e:
             logger.error(f"Error calling LLM: {e}")
+            if deterministic_tx:
+                # Guaranteed fallback execution even if LLM API is completely unreachable
+                logger.info("Executing guaranteed deterministic transaction fallback due to LLM error...")
+                try:
+                    tx, acc, budget_alert = await finance.add_transaction(
+                        user_id=user_id,
+                        amount=deterministic_tx["amount"],
+                        tx_type=deterministic_tx["type"],
+                        category_name="Прочие расходы" if deterministic_tx["type"] == TransactionType.EXPENSE else "Зарплата и аванс",
+                        account_name=deterministic_tx["account_name"],
+                        description=deterministic_tx["description"]
+                    )
+                    sign = "-" if deterministic_tx["type"] == TransactionType.EXPENSE else "+"
+                    return {
+                        "text": f"✅ <b>Записано:</b> {deterministic_tx['description']} ({sign}{deterministic_tx['amount']:,.0f} сум)\n💳 <b>Счет:</b> {acc.name} (остаток: <b>{acc.balance:,.0f} сум</b>)",
+                        "actions": [{
+                            "type": "transaction_added",
+                            "tx_id": tx.id,
+                            "tx_type": deterministic_tx["type"].value,
+                            "amount": deterministic_tx["amount"],
+                            "category": tx.category.name if tx.category else "Прочие расходы",
+                            "account": acc.name,
+                            "balance": acc.balance,
+                            "desc": deterministic_tx["description"],
+                            "budget_alert": budget_alert
+                        }]
+                    }
+                except Exception as db_err:
+                    logger.error(f"Fallback DB error: {db_err}")
+
             return {
                 "text": f"⚠️ Не удалось связаться с ИИ-моделью: {str(e)}",
                 "actions": []
@@ -448,7 +563,7 @@ class AIService:
             ]
             user_has_tx = has_amount and any(w in user_msg.lower() for w in tx_words)
 
-            if claims_registration or user_has_tx:
+            if claims_registration or user_has_tx or deterministic_tx:
                 logger.warning("Model attempted to respond without calling add_transaction for a transaction request. Intercepting and forcing tool_choice='add_transaction'...")
                 try:
                     forced_response = await self.client.chat.completions.create(
@@ -464,6 +579,33 @@ class AIService:
                         choice = forced_choice
                 except Exception as ex:
                     logger.error(f"Error during forced tool call retry: {ex}")
+
+            # Guaranteed deterministic fallback execution if LLM stubbornly failed to call tool
+            if not tool_calls and deterministic_tx:
+                logger.info("Executing guaranteed deterministic transaction fallback...")
+                tx, acc, budget_alert = await finance.add_transaction(
+                    user_id=user_id,
+                    amount=deterministic_tx["amount"],
+                    tx_type=deterministic_tx["type"],
+                    category_name="Прочие расходы" if deterministic_tx["type"] == TransactionType.EXPENSE else "Зарплата и аванс",
+                    account_name=deterministic_tx["account_name"],
+                    description=deterministic_tx["description"]
+                )
+                sign = "-" if deterministic_tx["type"] == TransactionType.EXPENSE else "+"
+                return {
+                    "text": f"✅ <b>Записано:</b> {deterministic_tx['description']} ({sign}{deterministic_tx['amount']:,.0f} сум)\n💳 <b>Счет:</b> {acc.name} (остаток: <b>{acc.balance:,.0f} сум</b>)",
+                    "actions": [{
+                        "type": "transaction_added",
+                        "tx_id": tx.id,
+                        "tx_type": deterministic_tx["type"].value,
+                        "amount": deterministic_tx["amount"],
+                        "category": tx.category.name if tx.category else "Прочие расходы",
+                        "account": acc.name,
+                        "balance": acc.balance,
+                        "desc": deterministic_tx["description"],
+                        "budget_alert": budget_alert
+                    }]
+                }
 
         if tool_calls:
             # Append model's assistant message with tool calls
