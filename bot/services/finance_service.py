@@ -616,6 +616,42 @@ class FinanceService:
             "new_balance": account.balance if account else 0.0
         }
 
+    async def get_recent_transactions(self, user_id: int, limit: int = 10) -> List[Transaction]:
+        """Returns the most recent transactions for the user."""
+        stmt = select(Transaction).where(Transaction.user_id == user_id).order_by(Transaction.id.desc()).limit(limit).options(
+            selectinload(Transaction.account),
+            selectinload(Transaction.category)
+        )
+        res = await self.session.execute(stmt)
+        return list(res.scalars().all())
+
+    async def delete_transaction_by_filter(
+        self,
+        user_id: int,
+        tx_id: Optional[int] = None,
+        amount: Optional[float] = None,
+        description: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Deletes a matching transaction and rolls back account balance."""
+        if tx_id:
+            return await self.delete_transaction(tx_id, user_id)
+
+        stmt = select(Transaction).where(Transaction.user_id == user_id)
+        if amount:
+            stmt = stmt.where(Transaction.amount == amount)
+        if description:
+            stmt = stmt.where(Transaction.description.ilike(f"%{description.strip()}%"))
+
+        stmt = stmt.order_by(Transaction.id.desc()).limit(1).options(
+            selectinload(Transaction.account),
+            selectinload(Transaction.category)
+        )
+        res = await self.session.execute(stmt)
+        tx = res.scalar_one_or_none()
+        if not tx:
+            return None
+        return await self.delete_transaction(tx.id, user_id)
+
     async def delete_last_transaction(self, user_id: int) -> Optional[Dict[str, Any]]:
         last_tx = await self.get_last_transaction(user_id)
         if not last_tx:

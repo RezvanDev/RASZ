@@ -57,7 +57,10 @@ async def cmd_help(message: Message):
         "• <i>«Оплатил рассрочку 1 200 000 сум с карты Uzcard»</i>\n\n"
         "4. <b>Финансовые цели:</b>\n"
         "• <i>«Хочу накопить 15 000 000 сум на ноутбук до 2025-08-01»</i>\n\n"
-        "5. <b>Консультация финансиста:</b>\n"
+        "5. <b>Управление операциями:</b>\n"
+        "• /last — список последних операций с кнопками быстрой отмены\n"
+        "• /delete &lt;ID&gt; — удалить операцию по номеру и вернуть деньги на счет\n\n"
+        "6. <b>Консультация финансиста:</b>\n"
         "Спросите любой вопрос: <i>«Какая у меня подушка безопасности?»</i>, <i>«Где я трачу больше всего?»</i>"
     )
     await message.answer(help_text)
@@ -394,4 +397,58 @@ async def cmd_backup(message: Message):
         document=doc,
         caption="📦 <b>Резервная копия базы данных (SQLite)</b>"
     )
+
+@router.message(Command("last"))
+async def cmd_last_transactions(message: Message, finance: FinanceService):
+    user_id = message.from_user.id
+    txs = await finance.get_recent_transactions(user_id, limit=10)
+    if not txs:
+        await message.answer("У вас пока нет сохраненных операций.")
+        return
+
+    from bot.database.models import TransactionType
+    text = "📋 <b>Последние операции:</b>\n────────────────────────\n"
+    buttons = []
+    for tx in txs:
+        sign = "-" if tx.type == TransactionType.EXPENSE else "+"
+        cat_icon = tx.category.icon if tx.category else "💡"
+        cat_name = tx.category.name if tx.category else "Без категории"
+        acc_name = tx.account.name if tx.account else "Счет"
+        desc = f" ({tx.description})" if tx.description else ""
+        date_str = tx.date.strftime("%d.%m %H:%M")
+
+        text += (
+            f"• <b>#{tx.id}</b> | {cat_icon} {cat_name}: <code>{sign}{tx.amount:,.0f} сум</code>\n"
+            f"  💳 {acc_name}{desc} | <i>{date_str}</i>\n\n"
+        )
+        buttons.append([
+            InlineKeyboardButton(text=f"🗑 Удалить #{tx.id} ({sign}{tx.amount:,.0f} сум)", callback_data=f"undo_tx_{tx.id}")
+        ])
+
+    text += "────────────────────────\n<i>Нажмите кнопку с нужным ID ниже, чтобы отменить операцию и вернуть баланс.</i>"
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+@router.message(Command("delete"))
+@router.message(Command("del"))
+async def cmd_delete_tx(message: Message, finance: FinanceService):
+    args = message.text.strip().split()
+    if len(args) < 2 or not args[1].isdigit():
+        await message.answer(
+            "ℹ️ <b>Укажите ID транзакции для удаления</b>, например:\n"
+            "<code>/delete 42</code>\n\n"
+            "Список последних операций с их ID можно открыть командой: /last"
+        )
+        return
+
+    tx_id = int(args[1])
+    res = await finance.delete_transaction(tx_id, message.from_user.id)
+    if res:
+        await message.answer(
+            f"🗑 <b>Операция #{tx_id} успешно удалена:</b>\n"
+            f"• Категория: {res['category']}\n"
+            f"• Сумма: {res['amount']:,.0f} сум\n"
+            f"• Баланс счета <b>{res['account']}</b> восстановлен: <b>{res['new_balance']:,.0f} сум</b>"
+        )
+    else:
+        await message.answer(f"❌ Операция #{tx_id} не найдена или уже была удалена.")
 

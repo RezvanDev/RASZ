@@ -55,9 +55,9 @@ SYSTEM_FINANCIER_PROMPT = """Ты — персональный финансов�
      • balance: строго МИНУС оставшийся долг
      СТРОГО ЗАПРЕЩЕНО самостоятельно вызывать `transfer_funds` или списывать ежемесячный платеж, пока пользователь явно не напишет «оплатил платеж по рассрочке».
 
-6. Корректировки и исправления пользователя:
-   - Если пользователь пишет, что ошибся или уточняет/исправляет предыдущую запись:
-     ОБЯЗАТЕЛЬНО сначала вызови `delete_last_transaction`, чтобы удалить ошибочную операцию, а затем вызови правильный инструмент (`add_transaction` или `transfer_funds`).
+6. Корректировки, исправления и удаление ошибочных операций:
+   - Если пользователь пишет, что ошибся, просит отменить/удалить операцию (например: «удали транзакцию на 113749», «удали расход за месяц», «отмени последнюю покупку»):
+     ОБЯЗАТЕЛЬНО вызывай инструмент `delete_transaction` (с указанием суммы `amount` или описания `description`) или `delete_last_transaction`! Деньги будут автоматически возвращены на счет.
 
 7. Запрос дашбордов, инфографики и отчетов:
    - Если пользователь просит сделать или показать дашборд («Сделай дашборд дохода», «покажи дашборд расходов», «общий дашборд»):
@@ -220,6 +220,30 @@ TOOLS_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "delete_transaction",
+            "description": "Удалить или отменить ошибочную операцию (транзакцию) по сумме, описанию или ID. Списанные деньги автоматически возвращаются на баланс счета.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "amount": {
+                        "type": "number",
+                        "description": "Сумма ошибочной операции для удаления (например: 113749)"
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Название или описание ошибочной операции (например: Расходы за месяц)"
+                    },
+                    "tx_id": {
+                        "type": "integer",
+                        "description": "ID транзакции для удаления, если известен"
+                    }
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "delete_last_transaction",
             "description": "Отменить или удалить последнюю ошибочно записанную транзакцию (трату, доход).",
             "parameters": {
@@ -347,9 +371,25 @@ class AIService:
         text = user_message.strip()
         lower = text.lower().replace('\u00a0', ' ')
 
-        # 1. Skip pure advisory questions / dashboard requests
-        question_words = ["как ", "что ", "посоветуй", "подскажи", "почему", "зачем", "дашборд", "график", "отчет"]
-        if any(lower.startswith(q) or f" {q}" in lower for q in question_words) and not any(k in lower for k in ["потратил", "расход", "купил", "оплатил"]):
+        # 1. Skip pure questions, inquiries, statistical queries, and bug reports
+        inquiry_words = [
+            "как ", "что ", "посоветуй", "подскажи", "почему", "зачем", "сколько",
+            "какой", "какая", "какие", "где ", "когда ", "куда ", "откуда ",
+            "покажи", "показать", "проверь", "проверить", "выведи", "выгрузи",
+            "список", "статистика", "дашборд", "график", "отчет", "отчёт",
+            "не отобразился", "не записался", "не попал", "не видно", "не списалось",
+            "не изменилось", "не списан", "почему то", "почему-то",
+            "удали", "удалить", "отмени", "отменить"
+        ]
+        if any(w in lower for w in inquiry_words) or lower.endswith("?"):
+            return None
+
+        # 1.1 Skip statistical queries (e.g. "расходы за месяц", "доходы за год")
+        stat_phrases = [
+            "за месяц", "в месяц", "за год", "в год", "за неделю", "в неделю",
+            "за сегодня", "в день", "за все время", "за всё время"
+        ]
+        if any(sp in lower for sp in stat_phrases) and any(kw in lower for kw in ["расход", "доход", "трат", "баланс"]):
             return None
 
         # 2. Extract amount
@@ -566,56 +606,10 @@ class AIService:
         tool_calls = choice.message.tool_calls
         actions_taken = []
 
-        # INTERCEPTION & RETRY: If no tool was called, check if user message or model response indicates a transaction
+        # If no tool was called by the model
         if not tool_calls:
-            user_msg = ""
-            for m in reversed(messages):
-                if m.get("role") == "user":
-                    c = m.get("content")
-                    if isinstance(c, str):
-                        user_msg = c
-                    elif isinstance(c, list):
-                        for part in c:
-                            if isinstance(part, dict) and part.get("type") == "text":
-                                user_msg = part.get("text", "")
-                    break
-
-            bot_text_lower = (choice.message.content or "").lower()
-            hallucination_indicators = [
-                "успешно зарегистрирован", "успешно записан", "расход в размере",
-                "доход в размере", "зафиксирован", "записал расход", "записал доход",
-                "текущий баланс", "списан", "списано", "баланс составляет", "остаток составляет"
-            ]
-            claims_registration = any(h in bot_text_lower for h in hallucination_indicators)
-
-            import re
-            has_amount = bool(re.search(r'\d+', user_msg))
-            tx_words = [
-                "расход", "потратил", "потратила", "купил", "купила", "оплатил", "оплатила",
-                "трата", "чек", "доход", "зарплата", "аванс", "сум", "tbc", "uzcard", "humo",
-                "visa", "снюс", "кофе", "такси", "обед", "ужин", "бензин"
-            ]
-            user_has_tx = has_amount and any(w in user_msg.lower() for w in tx_words)
-
-            if claims_registration or user_has_tx or deterministic_tx:
-                logger.warning("Model attempted to respond without calling add_transaction for a transaction request. Intercepting and forcing tool_choice='add_transaction'...")
-                try:
-                    forced_response = await self.client.chat.completions.create(
-                        model=settings.LLM_MODEL,
-                        messages=messages,
-                        tools=TOOLS_DEFINITIONS,
-                        tool_choice={"type": "function", "function": {"name": "add_transaction"}},
-                        temperature=0.1
-                    )
-                    forced_choice = forced_response.choices[0]
-                    if forced_choice.message.tool_calls:
-                        tool_calls = forced_choice.message.tool_calls
-                        choice = forced_choice
-                except Exception as ex:
-                    logger.error(f"Error during forced tool call retry: {ex}")
-
-            # Guaranteed deterministic fallback execution if LLM stubbornly failed to call tool
-            if not tool_calls and deterministic_tx:
+            # If a transaction was deterministically recognized in user message, execute guaranteed fallback
+            if deterministic_tx:
                 logger.info("Executing guaranteed deterministic transaction fallback...")
                 tx, acc, budget_alert = await finance.add_transaction(
                     user_id=user_id,
@@ -688,8 +682,21 @@ class AIService:
                     if budget_alert:
                         tool_result_content += f" Предупреждение: {budget_alert}"
 
-                elif fn_name == "delete_last_transaction":
-                    deleted = await finance.delete_last_transaction(user_id)
+                elif fn_name in ("delete_transaction", "delete_last_transaction"):
+                    tx_id = fn_args.get("tx_id")
+                    del_amount = fn_args.get("amount")
+                    del_desc = fn_args.get("description")
+
+                    if tx_id or del_amount or del_desc:
+                        deleted = await finance.delete_transaction_by_filter(
+                            user_id=user_id,
+                            tx_id=tx_id,
+                            amount=del_amount,
+                            description=del_desc
+                        )
+                    else:
+                        deleted = await finance.delete_last_transaction(user_id)
+
                     if deleted:
                         actions_taken.append({
                             "type": "transaction_deleted",
@@ -698,12 +705,15 @@ class AIService:
                             "account": deleted["account"],
                             "balance": deleted["new_balance"]
                         })
-                        tool_result_content = f"Удалена последняя операция на {deleted['amount']:,.0f} сум. Новый баланс: {deleted['new_balance']:,.0f} сум."
+                        tool_result_content = (
+                            f"Удалена операция на {deleted['amount']:,.0f} сум ({deleted['category']}). "
+                            f"Баланс счета '{deleted['account']}' восстановлен: {deleted['new_balance']:,.0f} сум."
+                        )
                     else:
                         actions_taken.append({
                             "type": "transaction_delete_failed"
                         })
-                        tool_result_content = "Нет операций для отмены."
+                        tool_result_content = "Транзакция по указанным параметрам не найдена или уже удалена."
 
                 elif fn_name == "transfer_funds":
                     from_acc_name = fn_args["from_account_name"]
